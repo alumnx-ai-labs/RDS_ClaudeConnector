@@ -155,9 +155,16 @@ COLUMNS:
   home_phone, mobile_phone, work_phone, email_id
   address1, address2, city, state, zip
   first_activity    DATETIME — date of first visit
-  last_activity     DATETIME — date of most recent visit
+  last_activity     DATETIME — do NOT use this for last visit queries, it includes cancelled invoices
   status            VARCHAR — 'Active'
   gstn, is_otc_client
+
+⚠️  CRITICAL RULES for client visit queries:
+  - Always JOIN allpets_clients with allpets_invoice_line_items ON client_id
+  - Always filter WHERE cancelled = 'FALSE' to exclude cancelled/returned invoices
+  - Always use MAX(invoice_date) from allpets_invoice_line_items as the true last visit date
+  - Never use last_activity from allpets_clients — it is unreliable (includes cancelled visits)
+  - Use INNER JOIN (not LEFT JOIN) when querying active visiting clients
 
 USEFUL PATTERNS:
   -- New clients per month:
