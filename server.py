@@ -39,9 +39,20 @@ TABLE 1: allpets_invoice_line_items  (26,194 rows)
 PURPOSE: Every invoice line item billed at the clinic.
          One invoice = multiple rows (one row per product/service sold).
 
-⚠️  CRITICAL RULE: To get invoice-level revenue, always use:
-    GROUP BY invoice_id + MAX(invoice_amount)
-    because invoice_amount repeats on every line item of the same invoice.
+⚠️  CRITICAL RULES — read before writing any query:
+
+  1. INVOICE-LEVEL REVENUE (total billed per invoice, monthly revenue, client spend):
+     Use MAX(invoice_amount) with GROUP BY invoice_id
+     because invoice_amount is the same on every line item of the same invoice.
+
+  2. CATEGORY / PRODUCT / DOCTOR LEVEL REVENUE (breakdown by category, item, provider):
+     Use SUM(total) — the `total` column is the actual line item amount.
+     Always add: WHERE sales_id != '' — rows where sales_id='' are invoice header rows with no line item.
+     NEVER use invoice_amount for category-level breakdowns — it will give wrong inflated results.
+
+  3. ALWAYS filter cancelled = 'FALSE' for any revenue or visit count query.
+
+  4. DATE FILTERING: Use invoice_date >= 'YYYY-MM-01' AND invoice_date < 'YYYY-MM-01' (next month).
 
 COLUMNS:
   id                      INT AUTO_INCREMENT PRIMARY KEY
