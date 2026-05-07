@@ -30,6 +30,8 @@ SCHEMA = """
 ========================================================
   ALLPETS VETERINARY DATABASE — cohort_main (AWS RDS)
   Data Period: April 2025 – April 2026
+  Location: India | Currency: Indian Rupees (₹)
+  IMPORTANT: Always display all monetary amounts in ₹ (Indian Rupees), never in $ (dollars).
 ========================================================
 
 TABLE 1: allpets_invoice_line_items  (26,194 rows)
