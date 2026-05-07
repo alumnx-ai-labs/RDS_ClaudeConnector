@@ -1,0 +1,488 @@
+"""
+AllPets RDS MCP Server
+Connects Claude (web) to the AllPets MySQL database on AWS RDS.
+Transport: SSE (Server-Sent Events) for Claude web integration.
+Deploy on Render — PORT and DB credentials come from environment variables.
+"""
+
+import os
+from mcp.server.fastmcp import FastMCP
+import mysql.connector
+from decimal import Decimal
+from datetime import datetime, date
+
+# ── Database Configuration ────────────────────────────────────────────────────
+
+DB_CONFIG = {
+    "host":     os.environ.get("DB_HOST", "database-2-cohort-sandbox-db.cdokim6aw6op.ap-south-1.rds.amazonaws.com"),
+    "port":     int(os.environ.get("DB_PORT", "3306")),
+    "user":     os.environ.get("DB_USER", "cohort_student"),
+    "password": os.environ.get("DB_PASSWORD", "AlumnxLearn@2026"),
+    "database": os.environ.get("DB_NAME", "cohort_main"),
+    "charset":  "utf8mb4",
+}
+
+PORT = int(os.environ.get("PORT", "8000"))
+
+# ── Schema Documentation (fed to Claude as context) ───────────────────────────
+
+SCHEMA = """
+========================================================
+  ALLPETS VETERINARY DATABASE — cohort_main (AWS RDS)
+  Data Period: April 2025 – April 2026
+========================================================
+
+TABLE 1: allpets_invoice_line_items  (26,194 rows)
+─────────────────────────────────────────────────────
+PURPOSE: Every invoice line item billed at the clinic.
+         One invoice = multiple rows (one row per product/service sold).
+
+⚠️  CRITICAL RULE: To get invoice-level revenue, always use:
+    GROUP BY invoice_id + MAX(invoice_amount)
+    because invoice_amount repeats on every line item of the same invoice.
+
+COLUMNS:
+  id                      INT AUTO_INCREMENT PRIMARY KEY
+  sales_id                VARCHAR — line item ID (empty string for invoice-only rows)
+  invoice_id              VARCHAR — groups all line items of same invoice
+  patient_id              VARCHAR
+  invoice_no              VARCHAR — e.g. 'S4946' (Service), 'P12787' (Pharmacy)
+  invoice_date            DATETIME — e.g. '2025-04-01 10:49:07'
+  invoice_amount          DECIMAL(14,2) — total invoice value (same on every row of same invoice)
+  invoice_type            VARCHAR — 'Service' or 'Pharmacy'
+  cancelled               VARCHAR — 'FALSE' = active, 'TRUE' = cancelled/returned
+  invoice_balance         DECIMAL(14,2)
+  invoice_discount        DECIMAL(14,2)
+  invoice_taxable_amount  DECIMAL(14,2)
+  roundoff                DECIMAL(10,4)
+  otc                     VARCHAR — over-the-counter flag
+  gstin, client_gstn      VARCHAR — GST numbers
+  invoice_pdf_url         TEXT
+  biller_id, biller_name  VARCHAR
+  invoice_cgst_rate, invoice_cgst_amount   DECIMAL
+  invoice_sgst_rate, invoice_sgst_amount   DECIMAL
+  invoice_igst_rate, invoice_igst_amount   DECIMAL
+
+  CLIENT: client_id, client_unique_id, client_first_name, client_last_name,
+          mobile_phone, email_id
+
+  PATIENT: patient_name, patient_species (Canine/Feline/Avian/Rabbit etc.),
+           patient_breed, patient_gender, patient_birth_date, patient_weight
+
+  LINE ITEM:
+    plan_item_id, plan_item_name       — e.g. 'x-ray x 3 views', 'Nexgard 25-50kgs'
+    plan_category_id, plan_category_name   — e.g. 'Imaging', 'Grooming', 'Prescription 18%'
+    plan_sub_category_id, plan_sub_category_name  — e.g. 'Abdominal Radiography', 'NSAID'
+    brand_id, brand_name
+    quantity        DECIMAL(14,4)
+    fees            DECIMAL(14,2) — selling price per unit (before discount)
+    item_discount   DECIMAL(14,2)
+    item_tax_amount DECIMAL(14,2)
+    total           DECIMAL(14,2) — final line item amount
+    purchase_cost   DECIMAL(14,2) — cost price
+    item_cgst_rate, item_cgst_amount  DECIMAL
+    item_sgst_rate, item_sgst_amount  DECIMAL
+    item_igst_rate, item_igst_amount  DECIMAL
+    mfr, lot, expiry  VARCHAR — batch/expiry info for pharmacy
+
+  PROVIDER: provider_id, provider_name, performed_clinic_id, performed_clinic_name,
+            performed_date, visit_id, visit_name, created_by, req_id
+  clinic_id, clinic_name, vetbuddy_instance_id
+
+USEFUL QUERY PATTERNS:
+
+  -- Monthly revenue (non-cancelled invoices):
+  SELECT DATE_FORMAT(invoice_date,'%Y-%m') AS month, ROUND(SUM(m),2) AS revenue
+  FROM (SELECT invoice_id, invoice_date, MAX(invoice_amount) m
+        FROM allpets_invoice_line_items WHERE cancelled='FALSE'
+        GROUP BY invoice_id, invoice_date) t
+  GROUP BY month ORDER BY month;
+
+  -- Revenue by invoice type (Service vs Pharmacy):
+  SELECT invoice_type, ROUND(SUM(m),2) AS revenue
+  FROM (SELECT invoice_id, invoice_type, MAX(invoice_amount) m
+        FROM allpets_invoice_line_items WHERE cancelled='FALSE'
+        GROUP BY invoice_id, invoice_type) t
+  GROUP BY invoice_type;
+
+  -- Revenue by category (use line item total, NOT invoice_amount):
+  SELECT plan_category_name, ROUND(SUM(total),2) AS revenue, COUNT(*) AS items_sold
+  FROM allpets_invoice_line_items
+  WHERE cancelled='FALSE' AND sales_id != ''
+  GROUP BY plan_category_name ORDER BY revenue DESC;
+
+  -- Top patients/species by visit count:
+  SELECT patient_species, COUNT(DISTINCT invoice_id) AS visits
+  FROM allpets_invoice_line_items WHERE cancelled='FALSE'
+  GROUP BY patient_species ORDER BY visits DESC;
+
+  -- Top clients by spend:
+  SELECT client_first_name, client_last_name, mobile_phone,
+         COUNT(DISTINCT invoice_id) AS invoices, ROUND(SUM(m),2) AS total_spent
+  FROM (SELECT invoice_id, client_first_name, client_last_name, mobile_phone,
+               MAX(invoice_amount) m
+        FROM allpets_invoice_line_items WHERE cancelled='FALSE'
+        GROUP BY invoice_id, client_first_name, client_last_name, mobile_phone) t
+  GROUP BY client_first_name, client_last_name, mobile_phone
+  ORDER BY total_spent DESC LIMIT 10;
+
+  -- Top selling products:
+  SELECT plan_item_name, SUM(quantity) AS qty_sold, ROUND(SUM(total),2) AS revenue
+  FROM allpets_invoice_line_items
+  WHERE cancelled='FALSE' AND sales_id != ''
+  GROUP BY plan_item_name ORDER BY revenue DESC LIMIT 20;
+
+  -- Doctor/provider performance:
+  SELECT provider_name, COUNT(DISTINCT invoice_id) AS cases,
+         ROUND(SUM(total),2) AS revenue_generated
+  FROM allpets_invoice_line_items
+  WHERE cancelled='FALSE' AND sales_id != '' AND provider_name != ''
+  GROUP BY provider_name ORDER BY revenue_generated DESC;
+
+
+TABLE 2: allpets_clients  (1,361 rows)
+─────────────────────────────────────────────────────
+PURPOSE: Unique client (pet owner) master records.
+
+COLUMNS:
+  client_id         VARCHAR PRIMARY KEY
+  vetbuddy_instance_id VARCHAR
+  clinic_id, clinic_name
+  client_unique_id, crm_client_id
+  first_name, last_name
+  home_phone, mobile_phone, work_phone, email_id
+  address1, address2, city, state, zip
+  first_activity    DATETIME — date of first visit
+  last_activity     DATETIME — date of most recent visit
+  status            VARCHAR — 'Active'
+  gstn, is_otc_client
+
+USEFUL PATTERNS:
+  -- New clients per month:
+  SELECT DATE_FORMAT(first_activity,'%Y-%m') AS month, COUNT(*) AS new_clients
+  FROM allpets_clients GROUP BY month ORDER BY month;
+
+  -- Client retention (visited more than once):
+  SELECT c.client_id, c.first_name, c.last_name,
+         COUNT(DISTINCT i.invoice_id) AS total_visits
+  FROM allpets_clients c
+  JOIN allpets_invoice_line_items i ON c.client_id = i.client_id
+  WHERE i.cancelled='FALSE'
+  GROUP BY c.client_id, c.first_name, c.last_name
+  HAVING total_visits > 1 ORDER BY total_visits DESC;
+
+
+TABLE 3: allpets_appointments  (6,078 rows)
+─────────────────────────────────────────────────────
+PURPOSE: All appointment bookings.
+
+COLUMNS:
+  appointment_id            VARCHAR PRIMARY KEY
+  vetbuddy_instance_id
+  client_id, client_unique_id
+  patient_id, patient_name
+  appointment_type_id, appointment_type_name  — e.g. 'Consultation', 'Grooming', 'Surgery'
+  reason_for_visit_id, reason_for_visit_name  — e.g. 'Routine Checkup', 'Vaccination'
+  visit_id, visit_name
+  clinic_id, clinic_name
+  provider_id, provider_name
+  appointment_start_time   DATETIME
+  appointment_end_time     DATETIME
+  appointment_status       VARCHAR — e.g. 'Completed', 'Cancelled', 'No Show'
+  check_in_time            DATETIME
+  check_out_time           DATETIME
+  completed_time           DATETIME
+  is_no_show               VARCHAR
+
+USEFUL PATTERNS:
+  -- Daily appointment count:
+  SELECT DATE(appointment_start_time) AS day, COUNT(*) AS appointments
+  FROM allpets_appointments
+  GROUP BY day ORDER BY day;
+
+  -- Appointments by type:
+  SELECT appointment_type_name, COUNT(*) AS count
+  FROM allpets_appointments
+  GROUP BY appointment_type_name ORDER BY count DESC;
+
+  -- No-show rate:
+  SELECT COUNT(*) AS total,
+         SUM(is_no_show IN ('true','TRUE','1','Yes')) AS no_shows,
+         ROUND(SUM(is_no_show IN ('true','TRUE','1','Yes'))*100.0/COUNT(*),1) AS no_show_pct
+  FROM allpets_appointments;
+
+
+TABLE 4: allpets_payments  (10,957 rows)
+─────────────────────────────────────────────────────
+PURPOSE: Actual payment transactions received.
+         Use this for cash collected, not invoice_amount for billed amounts.
+
+COLUMNS:
+  payment_id            VARCHAR PRIMARY KEY
+  vetbuddy_instance_id
+  clinic_id, clinic_name
+  client_id, client_name, client_unique_id
+  invoice_id, invoice_no, invoice_amount, invoice_type
+  payment_amount        DECIMAL(14,2) — actual amount paid
+  receipt_no            VARCHAR
+  payment_date          DATETIME
+  payment_type_id, payment_type_name  — e.g. 'Cash', 'Card', 'UPI', 'Online'
+  creator               VARCHAR
+  returned              VARCHAR
+
+USEFUL PATTERNS:
+  -- Monthly cash collected:
+  SELECT DATE_FORMAT(payment_date,'%Y-%m') AS month,
+         ROUND(SUM(payment_amount),2) AS collected
+  FROM allpets_payments GROUP BY month ORDER BY month;
+
+  -- Payment method breakdown:
+  SELECT payment_type_name, COUNT(*) AS transactions,
+         ROUND(SUM(payment_amount),2) AS total
+  FROM allpets_payments GROUP BY payment_type_name ORDER BY total DESC;
+
+  -- Outstanding balances (invoiced but not fully paid):
+  SELECT i.invoice_id, MAX(i.invoice_amount) AS billed,
+         COALESCE(SUM(p.payment_amount),0) AS paid,
+         MAX(i.invoice_amount) - COALESCE(SUM(p.payment_amount),0) AS balance
+  FROM allpets_invoice_line_items i
+  LEFT JOIN allpets_payments p ON i.invoice_id = p.invoice_id
+  WHERE i.cancelled='FALSE'
+  GROUP BY i.invoice_id
+  HAVING balance > 0 ORDER BY balance DESC LIMIT 20;
+
+
+TABLE 5: allpets_stock  (9,111 rows)
+─────────────────────────────────────────────────────
+PURPOSE: Current inventory/stock snapshot.
+
+COLUMNS:
+  stock_consumed_id       VARCHAR PRIMARY KEY
+  stock_id, stock_name
+  is_group                VARCHAR
+  clinic_id, clinic_name
+  plan_item_id, plan_item_name
+  plan_category_id, plan_category_name
+  plan_sub_category_id, plan_sub_category_name
+  onhand_qty              DECIMAL(14,4) — current stock level
+  threshold_qty           DECIMAL(14,4) — minimum stock (reorder point)
+  reorder_qty             DECIMAL(14,4) — quantity to reorder
+  purchase_cost           DECIMAL(14,2) — cost price per unit
+  sales_markup            DECIMAL(10,2) — markup percentage
+  orderable               VARCHAR
+  bin_id, bin_name, bin_location
+
+USEFUL PATTERNS:
+  -- Items below reorder threshold:
+  SELECT stock_name, plan_category_name, onhand_qty, threshold_qty, reorder_qty
+  FROM allpets_stock
+  WHERE onhand_qty < threshold_qty AND threshold_qty > 0
+  ORDER BY (threshold_qty - onhand_qty) DESC;
+
+  -- Inventory value by category:
+  SELECT plan_category_name,
+         COUNT(*) AS items,
+         ROUND(SUM(onhand_qty * purchase_cost),2) AS inventory_value
+  FROM allpets_stock
+  WHERE purchase_cost > 0
+  GROUP BY plan_category_name ORDER BY inventory_value DESC;
+
+========================================================
+"""
+
+# ── MCP Server Setup ──────────────────────────────────────────────────────────
+
+mcp = FastMCP("AllPets RDS Connector", host="0.0.0.0", port=PORT)
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+
+def serialize(val):
+    if isinstance(val, Decimal):
+        return float(val)
+    if isinstance(val, (datetime, date)):
+        return str(val)
+    return val
+
+
+def execute_sql(sql: str):
+    conn = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        if cursor.description:
+            columns = [d[0] for d in cursor.description]
+            rows = [[serialize(v) for v in row] for row in cursor.fetchall()]
+            return columns, rows, None
+        else:
+            conn.commit()
+            return None, cursor.rowcount, None
+    except mysql.connector.Error as e:
+        return None, None, str(e)
+    finally:
+        if conn:
+            conn.close()
+
+
+def format_as_table(columns, rows, max_rows=200):
+    if not rows:
+        return "Query returned 0 rows."
+
+    display = rows[:max_rows]
+    str_rows = [[str(v) if v is not None else "NULL" for v in row] for row in display]
+    widths = [len(c) for c in columns]
+    for row in str_rows:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    sep    = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    header = "|" + "|".join(f" {c.ljust(w)} " for c, w in zip(columns, widths)) + "|"
+    lines  = [sep, header, sep]
+    for row in str_rows:
+        lines.append("|" + "|".join(f" {v.ljust(w)} " for v, w in zip(row, widths)) + "|")
+    lines.append(sep)
+
+    note = f"\nShowing {len(display)} of {len(rows)} rows." if len(rows) > max_rows else f"\nTotal: {len(rows)} rows."
+    return "\n".join(lines) + note
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_database_schema() -> str:
+    """
+    Returns the complete schema of all 5 AllPets tables — column names, data types,
+    relationships, and ready-to-use SQL query patterns.
+    ALWAYS call this first before writing any SQL query to understand the data structure.
+    """
+    return SCHEMA
+
+
+@mcp.tool()
+def run_sql_query(sql: str) -> str:
+    """
+    Executes any SQL query on the AllPets RDS MySQL database (cohort_main)
+    and returns formatted results.
+
+    For SELECT queries: returns a formatted table with column headers and rows.
+    For INSERT/UPDATE/DELETE: returns rows affected count.
+
+    Args:
+        sql: Any valid MySQL SQL statement.
+
+    Important notes:
+    - All 5 tables are in database cohort_main (already selected by default)
+    - Table names: allpets_invoice_line_items, allpets_clients,
+                   allpets_appointments, allpets_payments, allpets_stock
+    - For revenue queries: use GROUP BY invoice_id + MAX(invoice_amount)
+      because invoice_amount repeats on every line item row of the same invoice
+    - cancelled='FALSE' for active invoices, 'TRUE' for cancelled/returned
+    - invoice_date is DATETIME format: '2025-04-01 10:49:07'
+    """
+    columns, result, error = execute_sql(sql)
+
+    if error:
+        return f"SQL Error: {error}\n\nQuery:\n{sql}"
+
+    if columns is None:
+        return f"Query executed. Rows affected: {result}"
+
+    return format_as_table(columns, result)
+
+
+@mcp.tool()
+def get_sample_data(table_name: str, limit: int = 5) -> str:
+    """
+    Returns sample rows from any AllPets table to understand its data format.
+
+    Args:
+        table_name: One of:
+                    allpets_invoice_line_items
+                    allpets_clients
+                    allpets_appointments
+                    allpets_payments
+                    allpets_stock
+        limit: Number of rows (default 5, max 20)
+    """
+    ALLOWED = {
+        "allpets_invoice_line_items",
+        "allpets_clients",
+        "allpets_appointments",
+        "allpets_payments",
+        "allpets_stock",
+    }
+    if table_name not in ALLOWED:
+        return f"Invalid table. Choose from:\n" + "\n".join(sorted(ALLOWED))
+
+    limit = max(1, min(limit, 20))
+    columns, rows, error = execute_sql(
+        f"SELECT * FROM `{table_name}` LIMIT {limit}"
+    )
+    if error:
+        return f"Error: {error}"
+    return format_as_table(columns, rows)
+
+
+@mcp.tool()
+def get_table_stats() -> str:
+    """
+    Returns row counts, date ranges, and key statistics for all 5 AllPets tables.
+    Use this to understand the scope and freshness of available data.
+    """
+    queries = {
+        "allpets_invoice_line_items": """
+            SELECT
+                COUNT(*) AS total_rows,
+                COUNT(DISTINCT invoice_id) AS unique_invoices,
+                SUM(cancelled='FALSE') AS active_rows,
+                SUM(cancelled='TRUE') AS cancelled_rows,
+                MIN(invoice_date) AS earliest_invoice,
+                MAX(invoice_date) AS latest_invoice,
+                ROUND(SUM(CASE WHEN cancelled='FALSE' THEN 0 END),2) AS placeholder
+            FROM allpets_invoice_line_items
+        """,
+        "allpets_clients": """
+            SELECT COUNT(*) AS total_clients,
+                   MIN(first_activity) AS first_seen,
+                   MAX(last_activity) AS last_seen
+            FROM allpets_clients
+        """,
+        "allpets_appointments": """
+            SELECT COUNT(*) AS total_appointments,
+                   MIN(appointment_start_time) AS earliest,
+                   MAX(appointment_start_time) AS latest,
+                   COUNT(DISTINCT appointment_status) AS status_types
+            FROM allpets_appointments
+        """,
+        "allpets_payments": """
+            SELECT COUNT(*) AS total_payments,
+                   ROUND(SUM(payment_amount),2) AS total_collected,
+                   MIN(payment_date) AS earliest,
+                   MAX(payment_date) AS latest
+            FROM allpets_payments
+        """,
+        "allpets_stock": """
+            SELECT COUNT(*) AS total_items,
+                   COUNT(DISTINCT plan_category_name) AS categories,
+                   SUM(onhand_qty < threshold_qty AND threshold_qty > 0) AS items_below_threshold,
+                   ROUND(SUM(onhand_qty * purchase_cost),2) AS total_inventory_value
+            FROM allpets_stock
+        """,
+    }
+
+    output = []
+    for table, query in queries.items():
+        output.append(f"\n{'='*50}\n  {table}\n{'='*50}")
+        columns, rows, error = execute_sql(query.strip())
+        if error:
+            output.append(f"Error: {error}")
+        else:
+            output.append(format_as_table(columns, rows))
+
+    return "\n".join(output)
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print(f"Starting AllPets RDS MCP Server on port {PORT}")
+    mcp.run(transport="sse")
