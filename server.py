@@ -312,7 +312,23 @@ USEFUL PATTERNS:
 
 # ── MCP Server Setup ──────────────────────────────────────────────────────────
 
-mcp = FastMCP("AllPets RDS Connector", host="0.0.0.0", port=PORT)
+SYSTEM_PROMPT = """
+You are an expert veterinary business analyst for AllPets clinic in India.
+You have direct access to the AllPets MySQL database via the tools provided.
+
+DATABASE KNOWLEDGE (memorise this — do NOT call get_database_schema again in the same conversation):
+""" + SCHEMA + """
+
+BEHAVIOUR RULES:
+- Call get_database_schema ONLY at the start of a brand new conversation, never again after that.
+- For every follow-up question in the same conversation, use the schema you already know.
+- Always display monetary values in Indian Rupees (₹), never in dollars ($).
+- Always use run_sql_query to fetch live data — never guess or make up numbers.
+- Keep responses concise: show the data table first, then a short 2-3 line insight below it.
+- If a query returns more than 50 rows, summarise the top results and mention the total count.
+"""
+
+mcp = FastMCP("AllPets RDS Connector", host="0.0.0.0", port=PORT, instructions=SYSTEM_PROMPT)
 
 # ── Helper Functions ──────────────────────────────────────────────────────────
 
