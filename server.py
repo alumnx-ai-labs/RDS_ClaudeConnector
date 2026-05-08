@@ -307,6 +307,42 @@ USEFUL PATTERNS:
   WHERE purchase_cost > 0
   GROUP BY plan_category_name ORDER BY inventory_value DESC;
 
+TABLE 6: allpets_patient_diagnosis  (lab reports)
+─────────────────────────────────────────────────────
+PURPOSE: Patient lab/diagnostic reports (Pathology, outside labs etc.)
+         One row per lab report. Links to invoice via sales_id.
+
+COLUMNS:
+  lab_report_id           VARCHAR PRIMARY KEY
+  vetbuddy_instance_id    VARCHAR
+  lab_report_no           VARCHAR
+  clinic_id, clinic_name  VARCHAR
+  visit_id, visit_name    VARCHAR
+  patient_id, patient_name VARCHAR
+  client_id, client_name, client_unique_id VARCHAR
+  plan_item_id, plan_item_name    VARCHAR — e.g. 'Antech - CBC'
+  plan_sub_category_id, plan_sub_category_name  VARCHAR — e.g. 'Antech'
+  plan_category_id, plan_category_name  VARCHAR — e.g. 'Pathology / Lab - Outside'
+  form_type               VARCHAR — e.g. 'Diagnostic'
+  sales_id                VARCHAR — links to allpets_invoice_line_items.sales_id
+  report_date             DATETIME
+  result_date             DATETIME
+  status                  VARCHAR — e.g. 'Stored', 'Pending'
+  reported_by             VARCHAR
+  provider_id, provider_name VARCHAR
+  print_pdf_link          TEXT
+
+USEFUL PATTERNS:
+  -- Lab reports by category:
+  SELECT plan_category_name, COUNT(*) AS reports
+  FROM allpets_patient_diagnosis
+  GROUP BY plan_category_name ORDER BY reports DESC;
+
+  -- Pending lab reports:
+  SELECT patient_name, client_name, plan_item_name, report_date
+  FROM allpets_patient_diagnosis
+  WHERE status = 'Pending' ORDER BY report_date DESC;
+
 ========================================================
 """
 
@@ -445,6 +481,7 @@ def get_sample_data(table_name: str, limit: int = 5) -> str:
         "allpets_appointments",
         "allpets_payments",
         "allpets_stock",
+        "allpets_patient_diagnosis",
     }
     if table_name not in ALLOWED:
         return f"Invalid table. Choose from:\n" + "\n".join(sorted(ALLOWED))
@@ -461,7 +498,7 @@ def get_sample_data(table_name: str, limit: int = 5) -> str:
 @mcp.tool()
 def get_table_stats() -> str:
     """
-    Returns row counts, date ranges, and key statistics for all 5 AllPets tables.
+    Returns row counts, date ranges, and key statistics for all 6 AllPets tables.
     Use this to understand the scope and freshness of available data.
     """
     queries = {
@@ -502,6 +539,14 @@ def get_table_stats() -> str:
                    SUM(onhand_qty < threshold_qty AND threshold_qty > 0) AS items_below_threshold,
                    ROUND(SUM(onhand_qty * purchase_cost),2) AS total_inventory_value
             FROM allpets_stock
+        """,
+        "allpets_patient_diagnosis": """
+            SELECT COUNT(*) AS total_reports,
+                   COUNT(DISTINCT client_id) AS unique_clients,
+                   COUNT(DISTINCT plan_category_name) AS categories,
+                   MIN(report_date) AS earliest_report,
+                   MAX(report_date) AS latest_report
+            FROM allpets_patient_diagnosis
         """,
     }
 
