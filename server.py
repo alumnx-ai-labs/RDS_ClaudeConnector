@@ -232,13 +232,26 @@ COLUMNS:
   visit_id, visit_name
   clinic_id, clinic_name
   provider_id, provider_name
-  appointment_start_time   DATETIME
-  appointment_end_time     DATETIME
+  appointment_start_time   DATETIME — ⚠️ STORED AS 0000-00-00, DO NOT USE FOR DATE FILTERING
+  appointment_end_time     DATETIME — ⚠️ STORED AS 0000-00-00, DO NOT USE FOR DATE FILTERING
   appointment_status       VARCHAR — actual values: 'Check Out' (completed), 'attending', 'Cancel', 'waiting', 'Pending'
-  check_in_time            DATETIME
-  check_out_time           DATETIME
+  check_in_time            DATETIME — ✅ has real dates, use this for patient arrival time queries
+  check_out_time           DATETIME — ✅ has real dates, use this for all date-based appointment queries
   completed_time           DATETIME
   is_no_show               VARCHAR
+
+⚠️  CRITICAL: For ANY date-based appointment query (daily counts, monthly trends, date ranges):
+  ALWAYS use check_out_time (5,803 rows populated, range Apr 2025–Apr 2026)
+  NEVER use appointment_start_time or appointment_end_time (all stored as 0000-00-00)
+
+  -- Correct pattern for daily customer count:
+  SELECT DATE(check_out_time) AS day,
+         COUNT(DISTINCT client_id) AS unique_customers,
+         COUNT(*) AS total_visits
+  FROM allpets_appointments
+  WHERE check_out_time >= '2026-04-11' AND check_out_time < '2026-05-01'
+    AND appointment_status = 'Check Out'
+  GROUP BY DATE(check_out_time) ORDER BY day;
 
 ⚠️  CRITICAL RULE FOR DISEASE / CONDITION QUERIES:
   ALWAYS use reason_for_visit_name from allpets_appointments for any question about:
