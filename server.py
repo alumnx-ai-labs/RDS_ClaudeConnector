@@ -107,7 +107,8 @@ COLUMNS:
                   Use: WHERE plan_item_name IN ('X-ray','x-ray x 2 views','x-ray x 3 views','X-ray Print')
   Ultrasound    : 'Ultrasound', 'AFAST (Abdominal Focused Assessment with Sonography)', 'TFAST (Thoracic Focused Assessment with Sonography)'
                   Use: WHERE plan_item_name LIKE '%ltrasound%' OR plan_item_name LIKE '%FAST%'
-  Laser machine : NOT in database — tell user this data is unavailable.
+  Laser machine : plan_item_name = 'Laser Therapy upto 5 mins'
+                  Use: WHERE plan_item_name = 'Laser Therapy upto 5 mins'
 
 ⚠️  FOR MEDICINE QUERIES:
   Use plan_category_name IN ('Prescription 18%','Prescription 12%','Prescription','Pharmacy') to filter medicines.
@@ -215,7 +216,7 @@ USEFUL PATTERNS:
 
 TABLE 3: allpets_appointments  (6,078 rows)
 ─────────────────────────────────────────────────────
-PURPOSE: All appointment bookings.
+PURPOSE: All appointment bookings. This is the ONLY correct source for disease/condition/ailment analysis.
 
 COLUMNS:
   appointment_id            VARCHAR PRIMARY KEY
@@ -225,7 +226,7 @@ COLUMNS:
   appointment_type_id, appointment_type_name  — e.g. 'Consultation', 'Grooming', 'Surgery'
   reason_for_visit_id, reason_for_visit_name  — actual values in DB:
     Vaccination types: 'Routine Vaccination - Adult Annual', 'Routine Vaccination - Rabies', 'Routine Vaccination - Feline Annual'
-    Diseases/Ailments: 'skin infection', 'Not Doing Well', 'Vomiting', 'Not Eating', 'Limping'
+    Diseases/Ailments: 'skin infection', 'skin problem', 'Not Doing Well', 'Vomiting', 'Not Eating', 'Limping', 'ear infection', 'Diarrhea', 'Fever'
     Procedures: 'Sales', 'Review', 'Check up', 'General Exam', 'Follow up', 'dressing', 'injection', 'castration'
     Other: 'Bath', 'hair cut', 'Swimming'
   visit_id, visit_name
@@ -233,13 +234,61 @@ COLUMNS:
   provider_id, provider_name
   appointment_start_time   DATETIME
   appointment_end_time     DATETIME
-  appointment_status       VARCHAR — e.g. 'Completed', 'Cancelled', 'No Show'
+  appointment_status       VARCHAR — actual values: 'Check Out' (completed), 'attending', 'Cancel', 'waiting', 'Pending'
   check_in_time            DATETIME
   check_out_time           DATETIME
   completed_time           DATETIME
   is_no_show               VARCHAR
 
+⚠️  CRITICAL RULE FOR DISEASE / CONDITION QUERIES:
+  ALWAYS use reason_for_visit_name from allpets_appointments for any question about:
+  diseases, ailments, conditions, symptoms, top conditions, disease trends.
+  NEVER use plan_item_name from allpets_invoice_line_items for this — plan_item_name contains
+  billing items (treatments, products like 'skin tape') NOT medical diagnoses.
+
+  To get species for condition analysis, JOIN appointments to invoice_line_items on patient_id:
+    JOIN (SELECT DISTINCT patient_id, patient_species
+          FROM allpets_invoice_line_items
+          WHERE patient_species != '') sp ON a.patient_id = sp.patient_id
+
+  Group similar conditions using CASE/LIKE:
+    WHEN LOWER(reason_for_visit_name) LIKE '%skin%' THEN 'Skin issues'
+    WHEN LOWER(reason_for_visit_name) LIKE '%vomit%' THEN 'Vomiting'
+    WHEN LOWER(reason_for_visit_name) LIKE '%limp%' THEN 'Limping/leg'
+    WHEN LOWER(reason_for_visit_name) LIKE '%not doing well%' THEN 'Not doing well'
+    WHEN LOWER(reason_for_visit_name) LIKE '%ear%' THEN 'Ear issues'
+    WHEN LOWER(reason_for_visit_name) LIKE '%not eat%' THEN 'Not eating'
+    WHEN LOWER(reason_for_visit_name) LIKE '%diarr%' THEN 'Diarrhea'
+    WHEN LOWER(reason_for_visit_name) LIKE '%fever%' THEN 'Fever'
+
+VERIFIED CONDITION COUNTS (use these to validate your query output):
+  Canine: Skin issues=96, Vomiting=95, Limping/leg=75, Ear issues=73,
+          Not doing well=51, Not eating=45, Diarrhea=32, Fever=23
+  Feline: Not doing well=24, Not eating=17, Vomiting=13, Limping/leg=10,
+          Diarrhea=9, Fever=6, Ear issues=5, Skin issues=4
+
 USEFUL PATTERNS:
+  -- Top canine conditions (correct approach):
+  SELECT
+    CASE
+      WHEN LOWER(reason_for_visit_name) LIKE '%skin%' THEN 'Skin issues'
+      WHEN LOWER(reason_for_visit_name) LIKE '%vomit%' THEN 'Vomiting'
+      WHEN LOWER(reason_for_visit_name) LIKE '%limp%' THEN 'Limping/leg'
+      WHEN LOWER(reason_for_visit_name) LIKE '%not doing well%' THEN 'Not doing well'
+      WHEN LOWER(reason_for_visit_name) LIKE '%ear%' THEN 'Ear issues'
+      WHEN LOWER(reason_for_visit_name) LIKE '%not eat%' THEN 'Not eating'
+      WHEN LOWER(reason_for_visit_name) LIKE '%diarr%' THEN 'Diarrhea'
+      WHEN LOWER(reason_for_visit_name) LIKE '%fever%' THEN 'Fever'
+      ELSE NULL
+    END AS condition_group,
+    COUNT(*) AS visit_count
+  FROM allpets_appointments a
+  JOIN (SELECT DISTINCT patient_id FROM allpets_invoice_line_items WHERE patient_species = 'Canine') sp
+    ON a.patient_id = sp.patient_id
+  WHERE reason_for_visit_name IS NOT NULL AND reason_for_visit_name != ''
+  GROUP BY condition_group HAVING condition_group IS NOT NULL
+  ORDER BY visit_count DESC;
+
   -- Daily appointment count:
   SELECT DATE(appointment_start_time) AS day, COUNT(*) AS appointments
   FROM allpets_appointments
@@ -252,8 +301,8 @@ USEFUL PATTERNS:
 
   -- No-show rate:
   SELECT COUNT(*) AS total,
-         SUM(is_no_show IN ('true','TRUE','1','Yes')) AS no_shows,
-         ROUND(SUM(is_no_show IN ('true','TRUE','1','Yes'))*100.0/COUNT(*),1) AS no_show_pct
+         SUM(appointment_status = 'Cancel') AS cancelled,
+         SUM(is_no_show IN ('true','TRUE','1','Yes')) AS no_shows
   FROM allpets_appointments;
 
 
