@@ -102,6 +102,27 @@ COLUMNS:
             performed_date, visit_id, visit_name, created_by, req_id
   clinic_id, clinic_name, vetbuddy_instance_id
 
+⚠️  KNOWN ITEM NAMES FOR EQUIPMENT QUERIES:
+  X-Ray items   : 'X-ray', 'x-ray x 2 views', 'x-ray x 3 views', 'X-ray Print'
+                  Use: WHERE plan_item_name IN ('X-ray','x-ray x 2 views','x-ray x 3 views','X-ray Print')
+  Ultrasound    : 'Ultrasound', 'AFAST (Abdominal Focused Assessment with Sonography)', 'TFAST (Thoracic Focused Assessment with Sonography)'
+                  Use: WHERE plan_item_name LIKE '%ltrasound%' OR plan_item_name LIKE '%FAST%'
+  Laser machine : NOT in database — tell user this data is unavailable.
+
+⚠️  FOR MEDICINE QUERIES:
+  Use plan_category_name IN ('Prescription 18%','Prescription 12%','Prescription','Pharmacy') to filter medicines.
+  Use SUM(quantity) for units sold, SUM(total) for revenue.
+
+⚠️  FOR TIME-BASED SPLITS (9am–9pm vs 9pm–9am):
+  Use HOUR(invoice_date) to extract hour from invoice_date.
+  Day shift  : HOUR(invoice_date) >= 9 AND HOUR(invoice_date) < 21
+  Night shift : HOUR(invoice_date) < 9 OR HOUR(invoice_date) >= 21
+
+⚠️  FOR NEW vs RETURNING CUSTOMERS (daily/monthly):
+  New customer    = client whose MIN(invoice_date) falls on that day (first ever invoice)
+  Returning       = client who has invoices before that day
+  Use allpets_clients.first_activity for first visit date.
+
 USEFUL QUERY PATTERNS:
 
   -- Monthly revenue (non-cancelled invoices):
@@ -202,7 +223,11 @@ COLUMNS:
   client_id, client_unique_id
   patient_id, patient_name
   appointment_type_id, appointment_type_name  — e.g. 'Consultation', 'Grooming', 'Surgery'
-  reason_for_visit_id, reason_for_visit_name  — e.g. 'Routine Checkup', 'Vaccination'
+  reason_for_visit_id, reason_for_visit_name  — actual values in DB:
+    Vaccination types: 'Routine Vaccination - Adult Annual', 'Routine Vaccination - Rabies', 'Routine Vaccination - Feline Annual'
+    Diseases/Ailments: 'skin infection', 'Not Doing Well', 'Vomiting', 'Not Eating', 'Limping'
+    Procedures: 'Sales', 'Review', 'Check up', 'General Exam', 'Follow up', 'dressing', 'injection', 'castration'
+    Other: 'Bath', 'hair cut', 'Swimming'
   visit_id, visit_name
   clinic_id, clinic_name
   provider_id, provider_name
